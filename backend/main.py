@@ -1,8 +1,8 @@
 import os
-import sqlite3
-import json
-import time
 import re
+import json
+import sqlite3
+import time
 from pathlib import Path
 
 import fitz
@@ -15,39 +15,35 @@ from google import genai
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
-API_KEY = os.getenv("GOOGLE_API_KEY")
-
-MODEL = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-3.8-flash"
-)
-
-EMBED_MODEL = os.getenv(
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+EMBEDDING_MODEL = os.getenv(
     "EMBEDDING_MODEL",
     "gemini-embedding-001"
 )
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data")))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = DATA_DIR / "studymate.db"
 
-client = genai.Client(api_key=API_KEY) if API_KEY else None
+client = genai.Client(api_key=GOOGLE_API_KEY) if GOOGLE_API_KEY else None
 
 
 # ============================================================
-# FASTAPI
+# APP
 # ============================================================
 
 app = FastAPI(
     title="AI StudyMate API",
-    description="Agentic RAG based laboratory manual study assistant"
+    description="Agentic RAG-based Lab Manual Analyzer",
+    version="1.0.0"
 )
 
 app.add_middleware(
@@ -64,70 +60,168 @@ app.add_middleware(
 # ============================================================
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    """
+    SQLite connection configured for concurrent access.
+    WAL + busy timeout prevents 'database is locked' errors.
+    """
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=60,
+        check_same_thread=False
+    )
+
     conn.row_factory = sqlite3.Row
+
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=60000")
+
     return conn
 
 
 def init_db():
-
     conn = get_db()
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS chunks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            filename TEXT,
-            page INTEGER,
-            text TEXT,
-            embedding TEXT
-        )
-    """)
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS documents (
+                filename TEXT PRIMARY KEY,
+                pages INTEGER NOT NULL,
+                chunks INTEGER NOT NULL
+            )
+        """)
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS documents (
-            filename TEXT PRIMARY KEY,
-            pages INTEGER,
-            chunks INTEGER
-        )
-    """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename TEXT NOT NULL,
+                page INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                embedding BLOB NOT NULL
+            )
+        """)
 
-    conn.commit()
-    conn.close()
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_chunks_filename
+            ON chunks(filename)
+        """)
+
+        conn.commit()
+
+    finally:
+        conn.close()
 
 
 init_db()
 
 
 # ============================================================
-# REQUEST MODEL
+# MODELS
 # ============================================================
 
-class Req(BaseModel):
+class ChatRequest(BaseModel):
     question: str
     history: list = []
 
 
 # ============================================================
-# TEXT CHUNKING
+# BASIC HELPERS
 # ============================================================
 
-def make_chunks(text, size=900, overlap=150):
+def require_gemini():
+    if not GOOGLE_API_KEY or client is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Gemini API key is not configured."
+        )
 
-    text = " ".join(text.split())
+
+def clean_text(text):
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def normalize_embedding(vector):
+    arr = np.asarray(vector, dtype=np.float32)
+
+    norm = np.linalg.norm(arr)
+
+    if norm == 0:
+        return arr
+
+    return arr / norm
+
+
+# ============================================================
+# EXPERIMENT DETECTION
+# ============================================================
+
+def detect_experiment_number(question):
+    patterns = [
+        r"\bexperiment\s*(?:no\.?|number)?\s*(\d+)",
+        r"\bexp\s*(?:no\.?|number)?\s*(\d+)",
+        r"\bexperiment\s+(\d+)",
+        r"\bexp\s+(\d+)"
+    ]
+
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            question,
+            re.IGNORECASE
+        )
+
+        if match:
+            return int(match.group(1))
+
+    return None
+
+
+def experiment_match(text, experiment_number):
+    if experiment_number is None:
+        return False
+
+    patterns = [
+        rf"\bexperiment\s*{experiment_number}\b",
+        rf"\bexperiment\s*{experiment_number}\s*[:\-]",
+        rf"\bexp\s*{experiment_number}\b",
+        rf"\bexperiment\s*no\.?\s*{experiment_number}\b",
+        rf"\bexperiment\s*number\s*{experiment_number}\b"
+    ]
+
+    return any(
+        re.search(pattern, text, re.IGNORECASE)
+        for pattern in patterns
+    )
+
+
+# ============================================================
+# CHUNKING
+# ============================================================
+
+def make_chunks(text, page, chunk_size=900, overlap=150):
+    text = clean_text(text)
 
     if not text:
         return []
 
     chunks = []
+
     start = 0
 
     while start < len(text):
+        end = min(
+            start + chunk_size,
+            len(text)
+        )
 
-        end = start + size
-        chunk = text[start:end]
+        chunk = text[start:end].strip()
 
-        if chunk.strip():
-            chunks.append(chunk.strip())
+        if chunk:
+            chunks.append({
+                "page": page,
+                "text": chunk
+            })
 
         if end >= len(text):
             break
@@ -138,139 +232,542 @@ def make_chunks(text, size=900, overlap=150):
 
 
 # ============================================================
-# GEMINI EMBEDDING
+# GEMINI EMBEDDINGS
 # ============================================================
 
-def create_embedding(text):
+def embed_texts(texts):
+    require_gemini()
 
-    if not client:
-        raise HTTPException(
-            status_code=500,
-            detail="GOOGLE_API_KEY is not configured."
-        )
+    if not texts:
+        return []
 
-    try:
+    vectors = []
 
-        result = client.models.embed_content(
-            model=EMBED_MODEL,
-            contents=text
-        )
+    batch_size = 16
 
-        return result.embeddings[0].values
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
 
-    except Exception as e:
+        for attempt in range(3):
 
-        raise HTTPException(
-            status_code=500,
-            detail=f"Gemini embedding error: {str(e)}"
-        )
+            try:
+                result = client.models.embed_content(
+                    model=EMBEDDING_MODEL,
+                    contents=batch
+                )
+
+                batch_vectors = [
+                    normalize_embedding(e.values)
+                    for e in result.embeddings
+                ]
+
+                vectors.extend(batch_vectors)
+
+                break
+
+            except Exception:
+                if attempt == 2:
+                    raise
+
+                time.sleep(2)
+
+    return vectors
+
+
+def embedding_to_blob(vector):
+    return np.asarray(
+        vector,
+        dtype=np.float32
+    ).tobytes()
+
+
+def blob_to_embedding(blob):
+    return np.frombuffer(
+        blob,
+        dtype=np.float32
+    )
 
 
 # ============================================================
 # PDF INGESTION
 # ============================================================
 
-def ingest_pdf(filename, pdf_bytes):
-
-    if not client:
-        raise HTTPException(
-            status_code=500,
-            detail="GOOGLE_API_KEY is not configured."
-        )
-
+def extract_pdf_chunks(pdf_bytes, filename):
     try:
-
-        doc = fitz.open(
+        document = fitz.open(
             stream=pdf_bytes,
             filetype="pdf"
         )
+    except Exception as e:
+        raise Exception(
+            f"Could not open PDF: {e}"
+        )
 
-        all_chunks = []
+    all_chunks = []
 
-        for page_number, page in enumerate(doc, start=1):
+    try:
+        for page_number, page in enumerate(
+            document,
+            start=1
+        ):
+            text = page.get_text("text")
 
-            text = page.get_text()
+            text = clean_text(text)
 
-            chunks = make_chunks(text)
+            if not text:
+                continue
 
-            for chunk in chunks:
-
-                all_chunks.append({
-                    "filename": filename,
-                    "page": page_number,
-                    "text": chunk
-                })
-
-        doc.close()
-
-        if not all_chunks:
-            raise HTTPException(
-                status_code=400,
-                detail="No readable text was found in the PDF."
+            page_chunks = make_chunks(
+                text,
+                page_number
             )
+
+            all_chunks.extend(page_chunks)
+
+    finally:
+        document.close()
+
+    return all_chunks
+
+
+def ingest_pdf(filename, pdf_bytes):
+
+    chunks = extract_pdf_chunks(
+        pdf_bytes,
+        filename
+    )
+
+    if not chunks:
+        raise Exception(
+            "No readable text was found in the PDF."
+        )
+
+    texts = [
+        item["text"]
+        for item in chunks
+    ]
+
+    embeddings = embed_texts(texts)
+
+    if len(embeddings) != len(chunks):
+        raise Exception(
+            "Embedding count does not match chunk count."
+        )
+
+    # --------------------------------------------------------
+    # SQLite write operation
+    # WAL + transaction + retry
+    # --------------------------------------------------------
+
+    max_attempts = 5
+
+    for attempt in range(max_attempts):
 
         conn = get_db()
 
-        conn.execute(
-            "DELETE FROM chunks WHERE filename = ?",
-            (filename,)
-        )
+        try:
+            conn.execute("BEGIN IMMEDIATE")
 
-        conn.execute(
-            "DELETE FROM documents WHERE filename = ?",
-            (filename,)
-        )
+            # Remove old copy if same file uploaded again
+            conn.execute(
+                "DELETE FROM chunks WHERE filename = ?",
+                (filename,)
+            )
 
-        for item in all_chunks:
+            conn.execute(
+                "DELETE FROM documents WHERE filename = ?",
+                (filename,)
+            )
 
-            embedding = create_embedding(
-                item["text"]
+            for item, embedding in zip(
+                chunks,
+                embeddings
+            ):
+                conn.execute(
+                    """
+                    INSERT INTO chunks
+                    (filename, page, text, embedding)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        filename,
+                        item["page"],
+                        item["text"],
+                        embedding_to_blob(
+                            embedding
+                        )
+                    )
+                )
+
+            pages = len(
+                set(
+                    item["page"]
+                    for item in chunks
+                )
             )
 
             conn.execute(
                 """
-                INSERT INTO chunks
-                (filename, page, text, embedding)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO documents
+                (filename, pages, chunks)
+                VALUES (?, ?, ?)
                 """,
                 (
-                    item["filename"],
-                    item["page"],
-                    item["text"],
-                    json.dumps(embedding)
+                    filename,
+                    pages,
+                    len(chunks)
                 )
             )
 
-        pages = len(
-            set(item["page"] for item in all_chunks)
+            conn.commit()
+
+            return {
+                "filename": filename,
+                "pages": pages,
+                "chunks": len(chunks)
+            }
+
+        except sqlite3.OperationalError as e:
+
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+            if "locked" in str(e).lower():
+                if attempt < max_attempts - 1:
+                    time.sleep(
+                        1.5 * (attempt + 1)
+                    )
+                    continue
+
+            raise
+
+        finally:
+            conn.close()
+
+    raise Exception(
+        "Database remained locked after multiple attempts."
+    )
+
+
+# ============================================================
+# RETRIEVAL
+# ============================================================
+
+def search(question, top_k=6):
+
+    require_gemini()
+
+    query_embedding = embed_texts(
+        [question]
+    )[0]
+
+    conn = get_db()
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, filename, page, text, embedding
+            FROM chunks
+            """
+        ).fetchall()
+
+    finally:
+        conn.close()
+
+    if not rows:
+        return []
+
+    experiment_number = detect_experiment_number(
+        question
+    )
+
+    results = []
+
+    for row in rows:
+
+        vector = blob_to_embedding(
+            row["embedding"]
         )
 
-        chunk_count = len(all_chunks)
-
-        conn.execute(
-            """
-            INSERT INTO documents
-            (filename, pages, chunks)
-            VALUES (?, ?, ?)
-            """,
-            (
-                filename,
-                pages,
-                chunk_count
+        score = float(
+            np.dot(
+                query_embedding,
+                vector
             )
         )
 
-        conn.commit()
+        exact_match = experiment_match(
+            row["text"],
+            experiment_number
+        )
+
+        if exact_match:
+            score += 0.45
+
+        results.append({
+            "filename": row["filename"],
+            "page": row["page"],
+            "text": row["text"],
+            "score": score,
+            "exact_experiment": exact_match
+        })
+
+    results.sort(
+        key=lambda x: x["score"],
+        reverse=True
+    )
+
+    return results[:top_k]
+
+
+# ============================================================
+# GEMINI GENERATION
+# ============================================================
+
+def generate_with_fallback(prompt):
+
+    require_gemini()
+
+    models = [
+        GEMINI_MODEL,
+        "gemini-3.5-flash-lite",
+        "gemini-2.5-flash-lite"
+    ]
+
+    last_error = None
+
+    for model in models:
+
+        for attempt in range(2):
+
+            try:
+
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt
+                )
+
+                if response and response.text:
+                    return response.text
+
+            except Exception as e:
+
+                last_error = e
+
+                error_text = str(e).lower()
+
+                temporary = (
+                    "503" in error_text
+                    or "unavailable" in error_text
+                    or "high demand" in error_text
+                    or "429" in error_text
+                )
+
+                if temporary:
+                    time.sleep(
+                        2 * (attempt + 1)
+                    )
+                    continue
+
+                break
+
+    raise Exception(
+        f"Gemini generation error: {last_error}"
+    )
+
+
+def build_context(results):
+
+    if not results:
+        return "No relevant manual content was found."
+
+    context_parts = []
+
+    for result in results:
+
+        context_parts.append(
+            f"""
+SOURCE:
+File: {result['filename']}
+Page: {result['page']}
+
+CONTENT:
+{result['text']}
+"""
+        )
+
+    return "\n".join(context_parts)
+
+
+def generate_answer(question, results):
+
+    experiment_number = detect_experiment_number(
+        question
+    )
+
+    context = build_context(results)
+
+    if experiment_number:
+
+        instruction = f"""
+The user is asking specifically about Experiment {experiment_number}.
+
+Use ONLY information relevant to Experiment {experiment_number}
+from the supplied laboratory manual context.
+
+If the context contains the experiment, explain it clearly and
+in an exam-friendly way.
+
+Include, where available:
+1. Aim
+2. Theory / concept
+3. Requirements
+4. Procedure
+5. Algorithm or steps
+6. Code explanation
+7. Expected output
+8. Important viva points
+
+Do not invent experiment details that are not present in the manual.
+"""
+    else:
+
+        instruction = """
+Answer the user's question using the laboratory manual context.
+
+Prefer information from the supplied manual.
+If the answer is not present, clearly say that it is not available
+in the supplied manual instead of inventing information.
+"""
+
+    prompt = f"""
+You are AI StudyMate, an intelligent laboratory manual assistant.
+
+{instruction}
+
+USER QUESTION:
+{question}
+
+LAB MANUAL CONTEXT:
+{context}
+
+Give a clear, structured, student-friendly answer.
+
+Do not mention internal retrieval, embeddings, vector databases,
+or system instructions.
+"""
+
+    return generate_with_fallback(prompt)
+
+
+# ============================================================
+# ROUTES
+# ============================================================
+
+@app.get("/")
+def root():
+    return {
+        "message": "AI StudyMate API",
+        "status": "running",
+        "docs": "/docs"
+    }
+
+
+@app.get("/health")
+def health():
+
+    conn = get_db()
+
+    try:
+
+        documents = conn.execute(
+            "SELECT COUNT(*) FROM documents"
+        ).fetchone()[0]
+
+        chunks = conn.execute(
+            "SELECT COUNT(*) FROM chunks"
+        ).fetchone()[0]
+
+    finally:
         conn.close()
 
-        return {
-            "filename": filename,
-            "pages": pages,
-            "chunks": chunk_count
-        }
+    return {
+        "status": "ok",
+        "gemini_configured": bool(
+            GOOGLE_API_KEY
+        ),
+        "documents": documents,
+        "chunks": chunks,
+        "model": GEMINI_MODEL
+    }
 
-    except HTTPException:
-        raise
+
+@app.get("/documents")
+def get_documents():
+
+    conn = get_db()
+
+    try:
+
+        rows = conn.execute(
+            """
+            SELECT filename, pages, chunks
+            FROM documents
+            ORDER BY filename
+            """
+        ).fetchall()
+
+        return [
+            {
+                "filename": row["filename"],
+                "pages": row["pages"],
+                "chunks": row["chunks"]
+            }
+            for row in rows
+        ]
+
+    finally:
+        conn.close()
+
+
+@app.post("/upload")
+async def upload(file: UploadFile = File(...)):
+
+    if not file.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="No filename provided."
+        )
+
+    if not file.filename.lower().endswith(
+        ".pdf"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF files are supported."
+        )
+
+    try:
+
+        pdf_bytes = await file.read()
+
+        if not pdf_bytes:
+            raise Exception(
+                "Uploaded PDF is empty."
+            )
+
+        result = ingest_pdf(
+            file.filename,
+            pdf_bytes
+        )
+
+        return {
+            "success": True,
+            "message": "PDF indexed successfully.",
+            **result
+        }
 
     except Exception as e:
 
@@ -280,581 +777,176 @@ def ingest_pdf(filename, pdf_bytes):
         )
 
 
-# ============================================================
-# COSINE SIMILARITY
-# ============================================================
-
-def cosine_similarity(a, b):
-
-    a = np.array(a, dtype=np.float32)
-    b = np.array(b, dtype=np.float32)
-
-    denominator = (
-        np.linalg.norm(a)
-        * np.linalg.norm(b)
-    )
-
-    if denominator == 0:
-        return 0
-
-    return float(
-        np.dot(a, b) / denominator
-    )
-
-
-# ============================================================
-# EXPERIMENT NUMBER DETECTION
-# ============================================================
-
-def detect_experiment_number(question):
-
-    patterns = [
-        r"experiment\s*(?:no\.?|number)?\s*(\d+)",
-        r"exp\s*(?:no\.?)?\s*(\d+)",
-        r"experiment\s*#\s*(\d+)"
-    ]
-
-    question_lower = question.lower()
-
-    for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            question_lower
-        )
-
-        if match:
-            return int(match.group(1))
-
-    return None
-
-
-# ============================================================
-# EXPERIMENT MATCHING
-# ============================================================
-
-def experiment_match(text, experiment_number):
-
-    if experiment_number is None:
-        return 0
-
-    text_lower = text.lower()
-
-    number = str(experiment_number)
-
-    patterns = [
-        rf"\bexperiment\s*{number}\b",
-        rf"\bexperiment\s*no\.?\s*{number}\b",
-        rf"\bexperiment\s*number\s*{number}\b",
-        rf"\bexp\.?\s*{number}\b",
-        rf"\bexp\s*no\.?\s*{number}\b"
-    ]
-
-    for pattern in patterns:
-
-        if re.search(pattern, text_lower):
-            return 1
-
-    return 0
-
-
-# ============================================================
-# RAG SEARCH
-# ============================================================
-
-def search(question, top_k=6):
-
-    query_embedding = create_embedding(
-        question
-    )
-
-    experiment_number = detect_experiment_number(
-        question
-    )
-
-    conn = get_db()
-
-    rows = conn.execute(
-        """
-        SELECT filename, page, text, embedding
-        FROM chunks
-        ORDER BY page
-        """
-    ).fetchall()
-
-    conn.close()
-
-    results = []
-
-    for row in rows:
-
-        try:
-
-            embedding = json.loads(
-                row["embedding"]
-            )
-
-            semantic_score = cosine_similarity(
-                query_embedding,
-                embedding
-            )
-
-            exact_match = experiment_match(
-                row["text"],
-                experiment_number
-            )
-
-            # ------------------------------------------------
-            # Hybrid score
-            # ------------------------------------------------
-
-            final_score = semantic_score
-
-            if experiment_number is not None:
-
-                if exact_match:
-                    final_score += 0.45
-
-                # Nearby experiment pages get a smaller boost
-                # after an exact experiment heading is found.
-                if exact_match:
-                    final_score += 0.10
-
-            results.append(
-                (
-                    final_score,
-                    {
-                        "filename": row["filename"],
-                        "page": row["page"],
-                        "text": row["text"],
-                        "semantic_score": semantic_score,
-                        "exact_match": exact_match
-                    }
-                )
-            )
-
-        except Exception:
-            continue
-
-    results.sort(
-        key=lambda x: x[0],
-        reverse=True
-    )
-
-    # --------------------------------------------------------
-    # If a specific experiment was requested, prioritize
-    # exact experiment chunks.
-    # --------------------------------------------------------
-
-    if experiment_number is not None:
-
-        exact = [
-            r for r in results
-            if r[1]["exact_match"] == 1
-        ]
-
-        other = [
-            r for r in results
-            if r[1]["exact_match"] == 0
-        ]
-
-        results = exact + other
-
-    return results[:top_k]
-
-
-# ============================================================
-# GEMINI GENERATION WITH RETRY + FALLBACK
-# ============================================================
-
-def generate_with_fallback(prompt):
-
-    if not client:
-
-        raise HTTPException(
-            status_code=500,
-            detail="GOOGLE_API_KEY is not configured."
-        )
-
-    for attempt in range(2):
-
-        try:
-
-            response = client.models.generate_content(
-                model=MODEL,
-                contents=prompt
-            )
-
-            if response.text:
-                return response.text
-
-        except Exception as e:
-
-            error_text = str(e)
-
-            if (
-                "503" not in error_text
-                and "UNAVAILABLE" not in error_text
-            ):
-
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Gemini generation error: {error_text}"
-                )
-
-            time.sleep(2)
-
-    fallback_models = [
-        "gemini-3.5-flash-lite",
-        "gemini-2.5-flash-lite"
-    ]
-
-    last_error = ""
-
-    for fallback in fallback_models:
-
-        try:
-
-            response = client.models.generate_content(
-                model=fallback,
-                contents=prompt
-            )
-
-            if response.text:
-                return response.text
-
-        except Exception as e:
-
-            last_error = str(e)
-
-    raise HTTPException(
-        status_code=503,
-        detail=(
-            "Gemini is temporarily unavailable. "
-            "Please try again in a few seconds. "
-            f"Last error: {last_error}"
-        )
-    )
-
-
-# ============================================================
-# RAG GENERATION
-# ============================================================
-
-def generate(req, instruction):
-
-    hits = search(req.question)
-
-    if not hits:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "No lab manual content is available. "
-                "Please upload a PDF first."
-            )
-        )
-
-    context_parts = []
-
-    for score, r in hits:
-
-        context_parts.append(
-            f"""
-[{r['filename']}, page {r['page']}]
-{r['text']}
-"""
-        )
-
-    context = "\n".join(context_parts)
-
-    experiment_number = detect_experiment_number(
-        req.question
-    )
-
-    experiment_instruction = ""
-
-    if experiment_number:
-
-        experiment_instruction = f"""
-The student is asking specifically about Experiment {experiment_number}.
-
-IMPORTANT:
-- First identify the actual Experiment {experiment_number} section
-  from the supplied context.
-- Do not confuse it with Experiment 2, 3, 4, etc.
-- Use the exact experiment title from the manual when available.
-- Prefer information from chunks containing
-  "Experiment {experiment_number}".
-- If the exact section is not present in the retrieved context,
-  clearly say that it could not be found.
-"""
-
-    prompt = f"""
-You are AI StudyMate, an intelligent laboratory manual
-study assistant.
-
-{instruction}
-
-{experiment_instruction}
-
-IMPORTANT RULES:
-
-1. Use the supplied laboratory manual context for
-   manual-specific facts.
-
-2. Do not invent experiment numbers, titles, procedures,
-   algorithms, code or results.
-
-3. If the student asks about an experiment, identify the
-   correct experiment before answering.
-
-4. Give clear and exam-friendly explanations.
-
-5. If code is requested, provide concise working code.
-
-6. If the manual does not contain enough information,
-   clearly say so.
-
-7. Organize answers with headings and bullet points
-   whenever useful.
-
-8. Mention page numbers when they are useful.
-
-MANUAL CONTEXT:
-{context}
-
-STUDENT QUESTION:
-{req.question}
-"""
-
-    answer = generate_with_fallback(
-        prompt
-    )
-
-    return answer, hits
-
-
-# ============================================================
-# ROOT
-# ============================================================
-
-@app.get("/")
-def root():
-
-    return {
-        "message": "AI StudyMate API",
-        "docs": "/docs"
-    }
-
-
-# ============================================================
-# HEALTH
-# ============================================================
-
-@app.get("/health")
-def health():
-
-    conn = get_db()
-
-    document_count = conn.execute(
-        "SELECT COUNT(*) FROM documents"
-    ).fetchone()[0]
-
-    chunk_count = conn.execute(
-        "SELECT COUNT(*) FROM chunks"
-    ).fetchone()[0]
-
-    conn.close()
-
-    return {
-        "status": "ok",
-        "gemini_configured": bool(client),
-        "documents": document_count,
-        "chunks": chunk_count,
-        "model": MODEL
-    }
-
-
-# ============================================================
-# DOCUMENT LIST
-# ============================================================
-
-@app.get("/documents")
-def documents():
-
-    conn = get_db()
-
-    rows = conn.execute(
-        """
-        SELECT filename, pages, chunks
-        FROM documents
-        ORDER BY filename
-        """
-    ).fetchall()
-
-    conn.close()
-
-    return [
-        dict(row)
-        for row in rows
-    ]
-
-
-# ============================================================
-# PDF UPLOAD
-# ============================================================
-
-@app.post("/upload")
-async def upload(
-    file: UploadFile = File(...)
-):
-
-    if not file.filename:
-
-        raise HTTPException(
-            status_code=400,
-            detail="File name missing."
-        )
-
-    if not file.filename.lower().endswith(".pdf"):
-
-        raise HTTPException(
-            status_code=400,
-            detail="Only PDF files are supported."
-        )
-
-    pdf_bytes = await file.read()
-
-    result = ingest_pdf(
-        file.filename,
-        pdf_bytes
-    )
-
-    return {
-        "message": "PDF uploaded and indexed successfully.",
-        **result
-    }
-
-
-# ============================================================
-# CHAT
-# ============================================================
-
 @app.post("/chat")
-def chat(req: Req):
+def chat(request: ChatRequest):
 
-    if not client:
-
-        raise HTTPException(
-            status_code=500,
-            detail="Configure GOOGLE_API_KEY first."
-        )
-
-    if not req.question.strip():
-
+    if not request.question.strip():
         raise HTTPException(
             status_code=400,
-            detail="Question required."
+            detail="Question cannot be empty."
         )
 
-    answer, hits = generate(
-        req,
-        "Answer the student's question."
-    )
+    try:
 
-    sources = []
-
-    seen = set()
-
-    for score, r in hits:
-
-        key = (
-            r["filename"],
-            r["page"]
+        results = search(
+            request.question,
+            top_k=6
         )
 
-        if key not in seen:
+        answer = generate_answer(
+            request.question,
+            results
+        )
 
-            sources.append({
+        sources = [
+            {
                 "filename": r["filename"],
                 "page": r["page"],
-                "score": round(score, 3)
-            })
+                "score": round(
+                    r["score"],
+                    3
+                )
+            }
+            for r in results
+        ]
 
-            seen.add(key)
+        return {
+            "answer": answer,
+            "sources": sources
+        }
 
-    return {
-        "answer": answer,
-        "sources": sources
-    }
+    except Exception as e:
 
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
 
-# ============================================================
-# VIVA
-# ============================================================
 
 @app.post("/viva")
-def viva(req: Req):
+def viva(request: ChatRequest):
 
-    if not client:
+    try:
+
+        results = search(
+            request.question,
+            top_k=6
+        )
+
+        context = build_context(
+            results
+        )
+
+        prompt = f"""
+You are an AI laboratory viva preparation assistant.
+
+Generate 10 important viva questions and answers
+based ONLY on the laboratory manual context below.
+
+Make them:
+- exam focused
+- concise
+- easy to understand
+- suitable for a CSE laboratory exam
+
+USER REQUEST:
+{request.question}
+
+LAB MANUAL CONTEXT:
+{context}
+
+Format:
+
+1. Question
+Answer:
+
+2. Question
+Answer:
+
+Continue until 10 questions.
+"""
+
+        answer = generate_with_fallback(
+            prompt
+        )
+
+        return {
+            "answer": answer
+        }
+
+    except Exception as e:
 
         raise HTTPException(
             status_code=500,
-            detail="Configure GOOGLE_API_KEY first."
+            detail=str(e)
         )
 
-    answer, _ = generate(
-        req,
-        """
-Create 10 important laboratory viva questions
-with short answers.
-
-Mix:
-
-- Basic questions
-- Conceptual questions
-- Implementation questions
-- Output questions
-- Important exam questions
-"""
-    )
-
-    return {
-        "answer": answer
-    }
-
-
-# ============================================================
-# STUDY PLAN
-# ============================================================
 
 @app.post("/study-plan")
-def study_plan(req: Req):
+def study_plan(request: ChatRequest):
 
-    if not client:
+    try:
+
+        results = search(
+            request.question,
+            top_k=6
+        )
+
+        context = build_context(
+            results
+        )
+
+        prompt = f"""
+You are an AI study planner for engineering students.
+
+Create a practical study plan based on the laboratory manual.
+
+Include:
+- topics to study
+- experiment order
+- important concepts
+- coding preparation
+- viva preparation
+- final revision checklist
+
+Keep it concise and useful.
+
+REQUEST:
+{request.question}
+
+LAB MANUAL:
+{context}
+"""
+
+        answer = generate_with_fallback(
+            prompt
+        )
+
+        return {
+            "answer": answer
+        }
+
+    except Exception as e:
 
         raise HTTPException(
             status_code=500,
-            detail="Configure GOOGLE_API_KEY first."
+            detail=str(e)
         )
 
-    answer, _ = generate(
-        req,
-        """
-Create a concise laboratory examination preparation plan.
 
-Include:
+# ============================================================
+# RUN DIRECTLY
+# ============================================================
 
-- Important experiments
-- Important concepts
-- Coding practice
-- Viva preparation
-- Common mistakes
-- Final revision checklist
-"""
+if __name__ == "__main__":
+
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(
+            os.getenv("PORT", "8000")
+        ),
+        reload=False
     )
-
-    return {
-        "answer": answer
-    }
